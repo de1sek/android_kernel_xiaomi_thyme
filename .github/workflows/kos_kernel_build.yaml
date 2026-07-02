@@ -1,0 +1,124 @@
+name: Build Xiaomi Thyme Kernel (Kscope)
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    name: Build Kernel
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          repository: Kscope-Devices/android_kernel_xiaomi_thyme
+          ref: sunflowerleaf
+
+      - name: Setup Build Environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex \
+            g++-multilib gcc-multilib git gnupg gperf imagemagick \
+            lib32ncurses-dev lib32readline-dev lib32z1-dev liblz4-tool \
+            libncurses5-dev libsdl1.2-dev libssl-dev libelf-dev libxml2 \
+            libxml2-utils lzop pngcrush rsync schedtool squashfs-tools \
+            xsltproc zip zlib1g-dev python3 python-is-python3
+
+      - name: Download Toolchains
+        run: |
+          # clang-r377782c (Clang 10.0.5)
+          # 源码 build.config.common 明确指定此版本
+          # 使用 crdroidandroid 的独立镜像仓库（基于 r377782c）
+          git clone --depth=1 \
+            https://github.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-6305083 \
+            ~/clang-r377782c
+
+          # AOSP GCC 4.9 64位（来自 LineageOS 镜像）
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 \
+            ~/gcc-aarch64
+
+          # AOSP GCC 4.9 32位（来自 LineageOS 镜像）
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9 \
+            ~/gcc-arm
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-kscope-thyme-sunflowerleaf-${{ github.run_id }}
+          restore-keys: |
+            ccache-kscope-thyme-sunflowerleaf-
+
+      - name: Configure ccache
+        run: |
+          ccache --max-size=5G
+          ccache --set-config=compression=true
+          ccache -z
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+
+      - name: Create Swap
+        run: |
+          sudo swapoff -a 2>/dev/null || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 10G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Build Kernel
+        run: |
+          CLANG=$HOME/clang-r377782c
+          GCC64=$HOME/gcc-aarch64
+          GCC32=$HOME/gcc-arm
+
+          export PATH="$CLANG/bin:$GCC64/bin:$GCC32/bin:$PATH"
+          export LD_LIBRARY_PATH="$CLANG/lib64:$CLANG/lib:$LD_LIBRARY_PATH"
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export KBUILD_BUILD_USER="de1sek"
+          export KBUILD_BUILD_HOST="GitHub-Actions"
+
+          # 打印工具链版本，便于核实
+          clang --version
+          aarch64-linux-android-gcc --version 2>/dev/null || true
+
+          make O=out clean 2>/dev/null || true
+          make O=out mrproper 2>/dev/null || true
+
+          make O=out vendor/thyme_user_defconfig
+
+          # 禁用 BUILD_ARM64_DT_OVERLAY（runner 上没有 mkdtimg）
+          scripts/config --file out/.config -d BUILD_ARM64_DT_OVERLAY
+          make O=out ARCH=arm64 olddefconfig
+
+          # build.config.aarch64 指定 CROSS_COMPILE=aarch64-linux-androidkernel-
+          # 但标准 AOSP GCC 4.9 的二进制前缀是 aarch64-linux-android-
+          # 使用 LLVM=1 + LLVM_IAS=1 后 GCC 几乎不参与编译，前缀差异不影响结果
+          make -j$(nproc --all) O=out \
+            CC="ccache clang" \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi-
+
+      - name: Show ccache stats
+        run: ccache -s
+
+      - name: Upload Kernel Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kernel-Thyme-Kscope-sunflowerleaf
+          path: |
+            out/arch/arm64/boot/Image
+            out/arch/arm64/boot/Image.gz
+          if-no-files-found: warn
